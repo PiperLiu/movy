@@ -29,7 +29,7 @@ let screenHeight = 1080;
 let antiAliasMethod = "msaa";
 let motionBlurSamples = 1;
 let bloomEnabled = false;
-let globalTimeline = gsap.timeline({ onComplete: stopCapture });
+let globalTimeline = gsap.timeline({ onComplete: stopRender });
 const mainTimeline = gsap.timeline();
 let stats: Stats = undefined;
 let capturer: CCapture = undefined;
@@ -50,9 +50,9 @@ globalTimeline.add(mainTimeline, "0");
 
 let options = {
   format: "webm",
-  framerate: 25,
+  framerate: 30,
   render: function () {
-    startCapture();
+    startRender();
   },
   timeline: 0,
 };
@@ -67,7 +67,7 @@ let rng = seedrandom("hello.");
 
 const commandQueue: Function[] = [];
 
-function startCapture({ resetTiming = true, name = document.title } = {}) {
+function startRender({ resetTiming = true, name = document.title } = {}) {
   if (gridHelper !== undefined) {
     gridHelper.visible = false;
   }
@@ -94,14 +94,23 @@ function startCapture({ resetTiming = true, name = document.title } = {}) {
   });
 
   (capturer as any).start();
+
+  (window as any).movy.isRendering = true;
 }
 
-function stopCapture() {
-  if (capturer !== undefined) {
+(window as any).movy = {
+  startRender,
+  isRendering: false,
+};
+
+function stopRender() {
+  if (capturer) {
     (capturer as any).stop();
     (capturer as any).save();
     capturer = undefined;
   }
+
+  (window as any).movy.isRendering = false;
 }
 
 function setupOrthoCamera() {
@@ -402,8 +411,8 @@ function createExplosionAnimation(
   {
     ease = "expo.out",
     duration = 2,
-    minRotation = -2 * Math.PI,
-    maxRotation = 2 * Math.PI,
+    minRotation = -4 * Math.PI,
+    maxRotation = 4 * Math.PI,
     minRadius = 1,
     maxRadius = 4,
     minScale = 1,
@@ -624,6 +633,9 @@ export function run() {
         throw `invalid command`;
       }
     }
+
+    // Always add 0.5s to the end of animation to avoid zero-length video.
+    mainTimeline.set({}, {}, "+=0.5");
 
     {
       // Create timeline GUI
@@ -925,22 +937,17 @@ class SceneObject {
     return this;
   }
 
-  rotateIn({ t, duration = 0.5 }: AnimationParameters = {}) {
+  rotateIn({ t, duration = 0.5, ease = "expo.out" }: AnimationParameters = {}) {
     commandQueue.push(() => {
-      const tl = gsap.timeline({ defaults: { duration } });
+      const tl = gsap.timeline({ defaults: { duration, ease } });
 
-      tl.from(
-        this._threeObject3d.rotation,
-        { z: Math.PI * 4, ease: "power.in", duration },
-        "<"
-      );
+      tl.from(this._threeObject3d.rotation, { z: Math.PI * 4, duration }, "<");
       tl.from(
         this._threeObject3d.scale,
         {
           x: Number.EPSILON,
           y: Number.EPSILON,
           z: Number.EPSILON,
-          ease: "power.in",
           duration,
         },
         "<"
@@ -1057,7 +1064,12 @@ class SceneObject {
         defaults: { duration, ease },
       });
 
-      tl.set(materials, { clippingPlanes });
+      // TODO: Clipping planes should be removed after animation.
+      // Dynamically attaching or detaching clipping planes are not well
+      // supported in three.js.
+      for (const material of materials) {
+        material.clippingPlanes = clippingPlanes;
+      }
 
       if (direction === "right") {
         clippingPlanes.push(
@@ -1088,8 +1100,6 @@ class SceneObject {
           y: object3d.position.y + (box.max.y - box.min.y),
         });
       }
-
-      tl.set(materials, { clippingPlanes: empty });
 
       mainTimeline.add(tl, t);
     });
@@ -1194,6 +1204,16 @@ class SceneObject {
     });
     return this;
   }
+
+  show({ duration = 0.001, t }: Shake2DParameters = {}) {
+    commandQueue.push(() => {
+      const tl = gsap.timeline({ defaults: { ease: "none", duration } });
+      tl.fromTo(this._threeObject3d, { visible: false }, { visible: true });
+
+      mainTimeline.add(tl, t);
+    });
+    return this;
+  }
 }
 
 interface ExplodeParameters extends AnimationParameters {
@@ -1214,41 +1234,27 @@ class GroupObject extends SceneObject {
     duration = 2,
     minRotation = -2 * Math.PI,
     maxRotation = 2 * Math.PI,
-    minRadius = 2,
+    minRadius = 0,
     maxRadius = 4,
     minScale = 1,
     maxScale = 1,
-    stagger = 0.03,
+    stagger = 0,
     speed,
   }: ExplodeParameters = {}) {
     commandQueue.push(() => {
       let tl: gsap.core.Timeline;
 
-      if (speed === "fastest") {
-        tl = createExplosionAnimation(this._threeObject3d, {
-          ease,
-          duration: 1.0,
-          minRotation,
-          maxRotation,
-          minRadius,
-          maxRadius,
-          minScale,
-          maxScale,
-          stagger: 0,
-        });
-      } else {
-        tl = createExplosionAnimation(this._threeObject3d, {
-          ease,
-          duration,
-          minRotation,
-          maxRotation,
-          minRadius,
-          maxRadius,
-          minScale,
-          maxScale,
-          stagger,
-        });
-      }
+      tl = createExplosionAnimation(this._threeObject3d, {
+        ease,
+        duration,
+        minRotation,
+        maxRotation,
+        minRadius,
+        maxRadius,
+        minScale,
+        maxScale,
+        stagger,
+      });
 
       mainTimeline.add(tl, t);
     });
@@ -1318,6 +1324,57 @@ function toThreeColor(color: string | number): THREE.Color {
     : new THREE.Color(color);
 }
 
+interface ChangeTextParameters extends AnimationParameters {
+  from?: number;
+  to?: number;
+}
+
+class TextObject extends GroupObject {
+  changeText(
+    func: (val: number) => string,
+    {
+      from = 0,
+      to = 1,
+      duration = 5,
+      ease = "expo.out",
+      t,
+    }: ChangeTextParameters = {}
+  ) {
+    commandQueue.push(() => {
+      const textMesh = this._threeObject3d as TextMesh;
+      const tl = gsap.timeline({ defaults: { duration, ease } });
+
+      const data = { val: from };
+      tl.to(data, {
+        val: to,
+        onUpdate: () => {
+          const text = func(data.val);
+          textMesh.text = text;
+        },
+      });
+
+      mainTimeline.add(tl, t);
+    });
+  }
+
+  typeText({ t, duration = 1 }: ChangeTextParameters = {}) {
+    commandQueue.push(() => {
+      const textMesh = this._threeObject3d as TextMesh;
+      const interval = duration / textMesh.children.length;
+
+      const tl = gsap.timeline({
+        defaults: { duration: interval, ease: "steps(1)" },
+      });
+
+      textMesh.children.forEach((letter) => {
+        tl.fromTo(letter, { visible: false }, { visible: true });
+      });
+
+      mainTimeline.add(tl, t);
+    });
+  }
+}
+
 interface AddTextParameters extends Transform, BasicMaterial {
   font?: string;
   fontSize?: number;
@@ -1326,10 +1383,10 @@ interface AddTextParameters extends Transform, BasicMaterial {
 export function addText(
   text: string,
   params: AddTextParameters = {}
-): GroupObject {
+): TextObject {
   const { color, letterSpacing, font, fontSize = 1 } = params;
 
-  const obj = new GroupObject();
+  const obj = new TextObject();
 
   commandQueue.push(async () => {
     obj._threeObject3d = new TextMesh({
@@ -1377,14 +1434,17 @@ export function addImage(
       });
 
       const geometry = new THREE.PlaneBufferGeometry(1, 1);
-      obj._threeObject3d = new THREE.Mesh(geometry, material);
+      const mesh = new THREE.Mesh(geometry, material);
 
       const ratio = texture.image.width / texture.image.height;
       if (ratio > 1) {
-        obj._threeObject3d.scale.y /= ratio;
+        mesh.scale.y /= ratio;
       } else {
-        obj._threeObject3d.scale.x *= ratio;
+        mesh.scale.x *= ratio;
       }
+
+      obj._threeObject3d = new THREE.Group();
+      obj._threeObject3d.add(mesh);
     }
 
     updateTransform(obj._threeObject3d, params);
@@ -1759,7 +1819,7 @@ function createBasicMaterial(basicMaterial: BasicMaterial) {
 function updateTransform(mesh: THREE.Object3D, transform: Transform) {
   // Scale
   if (transform.scale !== undefined) {
-    mesh.scale.setScalar(transform.scale);
+    mesh.scale.multiplyScalar(transform.scale);
   } else {
     if (transform.sx !== undefined) {
       mesh.scale.x = transform.sx;
@@ -1886,8 +1946,8 @@ export function setSeed(val: any) {
   rng = seedrandom(val);
 }
 
-export function random() {
-  return rng();
+export function random(min = 0, max = 1) {
+  return min + rng() * (max - min);
 }
 
 function getGridPosition({ rows = 1, cols = 1, width = 25, height = 14 } = {}) {
